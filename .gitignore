@@ -1,0 +1,17 @@
+# Buildozer / python-for-android
+.buildozer/
+bin/
+*.apk
+*.aab
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Chaves e keystores nunca vão para o repositório
+*.keystore
+*.jks
+keystore.txt
+.env
