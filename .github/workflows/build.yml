@@ -1,0 +1,184 @@
+# =============================================================================
+#  Compila o APK Android (debug) na nuvem com Buildozer.
+#
+#  Quando corre: a cada push para main/master, em pull requests e
+#  manualmente (separador Actions > "Build APK Android" > Run workflow).
+#
+#  Resultado: separador Actions > execução > secção "Artifacts" > ficheiro .apk
+#
+#  1.ª compilação: 30 a 60 min (descarrega o SDK/NDK e compila o Python para
+#  Android). Seguintes: em regra, menos de 15 min, graças à cache.
+# =============================================================================
+name: Build APK Android
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # O Buildozer lê SECAO_OPCAO do ambiente: substitui "version" do buildozer.spec.
+  # Cada compilação gera uma versão maior, que instala por cima da anterior.
+  APP_VERSION: 1.0.${{ github.run_number }}
+  # Sem perguntas interativas do python-for-android
+  PYTHONFORANDROID_PREREQUISITES_INSTALL_INTERACTIVE: "0"
+  # Local fixo do keystore de depuração (assinatura do APK)
+  ANDROID_USER_HOME: /home/runner/.android
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+  # Altere para v2, v3... para descartar a cache de compilação
+  CACHE_VERSION: v1
+
+jobs:
+  build-apk:
+    name: buildozer android debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v7
+
+      - name: Verificar ficheiros do projeto
+        run: |
+          missing=0
+          for f in main.py buildozer.spec data/icon.png data/icon_fg.png data/icon_bg.png data/presplash.png; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::Ficheiro em falta no repositório: $f"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Libertar espaço em disco
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Instalar dependências do sistema
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip autoconf automake autopoint gettext libtool libltdl-dev \
+            pkg-config zlib1g-dev libncurses-dev libffi-dev libssl-dev cmake
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Buildozer e Cython
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "buildozer==1.6.0" "cython<3.0" setuptools wheel
+          python --version
+          java -version
+          cython --version
+          python -c "import buildozer; print('Buildozer', buildozer.__version__)"
+
+      - name: Calcular chave da cache
+        id: cachekey
+        run: |
+          # Só as opções que mudam a parte nativa invalidam a cache
+          # (mudar main.py, título ou versão não obriga a recompilar tudo).
+          native=$({ grep -E '^[[:space:]]*(requirements|android\.(archs|api|minapi|ndk|ndk_api)|p4a\.(branch|commit|bootstrap|fork|url))[[:space:]]*=' buildozer.spec || true; } \
+            | tr -d '[:space:]' | sort | sha256sum | cut -c1-16)
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+          echo "Chave nativa: $native"
+
+      - name: Cache do Buildozer (SDK, NDK e compilação)
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          # Inclui o nome do repositório: a compilação guarda caminhos absolutos
+          # (/home/runner/work/<repo>/...), que mudam se o repositório for renomeado.
+          key: buildozer-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ github.repository }}-${{ steps.cachekey.outputs.native }}
+
+      - name: Keystore de depuração a partir de um secret (opcional)
+        id: keystore
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          mkdir -p "$ANDROID_USER_HOME"
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            printf '%s' "$DEBUG_KEYSTORE_B64" | base64 -d > "$ANDROID_USER_HOME/debug.keystore"
+            echo "from_secret=true" >> "$GITHUB_OUTPUT"
+            echo "Keystore restaurado a partir do secret ANDROID_DEBUG_KEYSTORE_B64."
+          else
+            echo "from_secret=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache do keystore de depuração (mesma assinatura entre compilações)
+        if: steps.keystore.outputs.from_secret != 'true'
+        uses: actions/cache@v6
+        with:
+          path: /home/runner/.android/debug.keystore
+          key: android-debug-keystore-${{ github.repository_id }}-v1
+
+      - name: Compilar APK (buildozer android debug)
+        run: buildozer android debug
+
+      - name: Localizar o APK
+        id: apk
+        run: |
+          shopt -s nullglob
+          apks=(bin/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::Nenhum APK encontrado em bin/. Veja o registo do passo anterior."
+            exit 1
+          fi
+          apk="${apks[0]}"
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$apk")" >> "$GITHUB_OUTPUT"
+          ls -la bin/
+          sha256sum "$apk"
+
+      - name: Publicar o APK (Artifacts)
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.apk.outputs.path }}
+          # false = descarrega-se o .apk diretamente (sem .zip)
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Resumo
+        env:
+          APK_NAME: ${{ steps.apk.outputs.name }}
+        run: |
+          {
+            echo "## APK pronto: \`$APK_NAME\`"
+            echo ""
+            echo "Versão **$APP_VERSION**. Descarregue-o em **Artifacts**, no fim desta página."
+            echo "No Android, permita \"instalar apps desconhecidos\" para o navegador ou o gestor de ficheiros."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Limpar downloads antes de guardar a cache
+        if: always()
+        run: |
+          rm -f ~/.buildozer/android/platform/*.zip \
+                ~/.buildozer/android/platform/android-sdk/*.zip || true
+          du -sh ~/.buildozer .buildozer 2>/dev/null || true
