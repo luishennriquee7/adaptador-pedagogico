@@ -4,7 +4,7 @@ Adaptador Pedagógico Inclusivo
 ==============================
 
 Aplicativo Android (Kivy) que ajuda professores a adaptar atividades escolares
-com Inteligência Artificial (API Claude, da Anthropic).
+com Inteligência Artificial, usando o plano gratuito da API do Google Gemini.
 
 Destaques
 ---------
@@ -13,7 +13,8 @@ Destaques
 * A chamada à API corre numa thread secundária, com streaming (SSE): o texto
   aparece enquanto é gerado e a interface nunca congela.
 * Chave da API digitada no app (com opção de guardá-la apenas no armazenamento
-  privado do app) ou lida da variável de ambiente ``ANTHROPIC_API_KEY``.
+  privado do app) ou lida da variável de ambiente ``GEMINI_API_KEY``.
+* Quando acaba a cota diária gratuita de um modelo, o app usa o outro sozinho.
 * Resultado com botões Copiar e Compartilhar.
 
 Testar no computador:  ``pip install kivy requests`` e depois ``python main.py``
@@ -35,19 +36,25 @@ __version__ = "1.0.0"
 # =============================================================================
 
 APP_TITLE = "Adaptador Pedagógico Inclusivo"
-API_URL = "https://api.anthropic.com/v1/messages"
-MODELS_URL = "https://api.anthropic.com/v1/models"
-ANTHROPIC_VERSION = "2023-06-01"
-ENV_API_KEY = "ANTHROPIC_API_KEY"
-CONSOLE_KEYS_URL = "https://platform.claude.com/settings/keys"
 USER_AGENT = "AdaptadorPedagogico/%s (Kivy; python-requests)" % __version__
 
-MAX_TOKENS = 16000          # inclui o raciocínio interno do modelo
-MAX_INPUT_CHARS = 20000     # limite da atividade colada (custo e tempo)
+# Google Gemini API: plano gratuito, com limites de pedidos por minuto e por dia
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_KEYS_URL = "https://aistudio.google.com/apikey"
+ENV_API_KEYS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")   # testes no computador
+KEY_PREFIX = "AIza"                                    # início das chaves do Google
+
+MAX_OUTPUT_TOKENS = 32768   # inclui os tokens de raciocínio do modelo
+MAX_INPUT_CHARS = 20000     # limite da atividade colada (tempo e cota gratuita)
 MIN_INPUT_CHARS = 15
 CONNECT_TIMEOUT = 15        # segundos
 READ_TIMEOUT = 180          # segundos sem receber nenhum byte do servidor
 MAX_RETRIES = 2             # novas tentativas automáticas em erros temporários
+PREFS_VERSION = 3           # 1 e 2 = versões anteriores do app (com outro serviço de IA)
+
+PRIVACY_NOTE = ("No plano gratuito do Gemini, o Google pode usar os textos enviados para "
+                "melhorar os produtos dele, e pessoas podem revisá-los. Nunca inclua "
+                "dados pessoais de estudantes.")
 
 
 @dataclass(frozen=True)
@@ -55,20 +62,25 @@ class ModelOption:
     id: str
     label: str
     description: str
-    effort: Optional[str]   # None = modelo não aceita o parâmetro "effort"
+    thinking: Optional[str] = "low"        # thinkingLevel (None = padrão do modelo)
+    fallback: Optional[str] = None         # alias usado se o Google retirar o modelo
+    quota_fallback: Optional[str] = None   # modelo usado quando acaba a cota diária
 
 
+# No plano gratuito, cada modelo tem a sua cota diária: o Flash tem poucos pedidos
+# por dia e o Flash-Lite, muitos mais. Quando a cota de um acaba, o app usa o outro.
 MODELS: List[ModelOption] = [
-    ModelOption("claude-sonnet-5", "Claude Sonnet 5",
-                "Recomendado: ótimo equilíbrio entre qualidade e rapidez.", "medium"),
-    ModelOption("claude-haiku-4-5-20251001", "Claude Haiku 4.5",
-                "Mais rápido e econômico; bom para atividades curtas.", None),
-    ModelOption("claude-opus-5-5", "Claude Opus 5.5",
-                "Máxima qualidade para atividades longas ou complexas (mais lento).",
-                "medium"),
+    ModelOption("gemini-3.8-flash", "Gemini 3.8 Flash",
+                "Recomendado: melhor qualidade. O plano gratuito permite poucos pedidos "
+                "por dia; quando acabarem, o app usa o Flash-Lite automaticamente.",
+                fallback="gemini-flash-latest", quota_fallback="gemini-3.5-flash-lite"),
+    ModelOption("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite",
+                "Mais rápido e com muito mais pedidos gratuitos por dia. Bom para uso "
+                "frequente e atividades curtas.",
+                fallback="gemini-flash-lite-latest", quota_fallback="gemini-3.8-flash"),
 ]
-MODEL_BY_ID: Dict[str, ModelOption] = {m.id: m for m in MODELS}
 DEFAULT_MODEL = MODELS[0].id
+MODEL_BY_ID: Dict[str, ModelOption] = {m.id: m for m in MODELS}
 
 
 @dataclass(frozen=True)
@@ -272,28 +284,33 @@ def build_user_prompt(topic: str, level_key: str, profile_key: str, activity: st
 
 def build_payload(model_id: str, topic: str, level_key: str, profile_key: str,
                   activity: str) -> dict:
-    """Monta o corpo JSON do pedido à Messages API (com streaming)."""
+    """Corpo do pedido para models.streamGenerateContent (o modelo vai na URL)."""
     model = MODEL_BY_ID.get(model_id) or MODEL_BY_ID[DEFAULT_MODEL]
-    payload = {
-        "model": model.id,
-        "max_tokens": MAX_TOKENS,
-        "stream": True,
-        "system": SYSTEM_PROMPT,
-        "messages": [{
+    body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{
             "role": "user",
-            "content": build_user_prompt(topic, level_key, profile_key, activity),
+            "parts": [{"text": build_user_prompt(topic, level_key, profile_key, activity)}],
         }],
+        "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS},
     }
-    if model.effort:
-        # Menos esforço = respostas mais rápidas e baratas, ainda com ótima qualidade.
-        payload["output_config"] = {"effort": model.effort}
-    return payload
+    # Raciocínio "low": responde mais depressa, com qualidade de sobra para a tarefa.
+    return with_thinking(body, model.thinking)
+
+
+def with_thinking(body: dict, level: Optional[str]) -> dict:
+    """Cópia do pedido com o nível de raciocínio indicado (None = padrão do modelo)."""
+    config = dict(body.get("generationConfig") or {})
+    if level:
+        config["thinkingConfig"] = {"thinkingLevel": level}
+    else:
+        config.pop("thinkingConfig", None)
+    return dict(body, generationConfig=config)
 
 
 def build_headers(api_key: str, stream: bool) -> Dict[str, str]:
     headers = {
-        "x-api-key": api_key,
-        "anthropic-version": ANTHROPIC_VERSION,
+        "x-goog-api-key": api_key,       # no cabeçalho: a chave nunca aparece na URL
         "content-type": "application/json",
         "user-agent": USER_AGENT,
     }
@@ -306,7 +323,7 @@ def build_headers(api_key: str, stream: bool) -> Dict[str, str]:
 
 
 class GenerationCancelled(Exception):
-    """O utilizador cancelou a geração."""
+    """O professor cancelou a geração."""
 
 
 class ApiError(Exception):
@@ -340,81 +357,93 @@ class ApiError(Exception):
         return " · ".join(parts)
 
 
-_ERROR_MESSAGES = {
-    "invalid_request_error": "A API recusou o pedido (pedido inválido).",
-    "authentication_error": ("Chave da API inválida, expirada ou revogada. "
-                             "Confira-a em “Chave API”."),
-    "billing_error": ("Há um problema de faturamento na conta da Anthropic. "
-                      "Verifique os créditos no Claude Console."),
-    "permission_error": "Esta chave não tem permissão para usar o modelo escolhido.",
-    "not_found_error": "Modelo não encontrado. Escolha outro modelo em “Chave API”.",
-    "request_too_large": "A atividade é grande demais. Reduza o texto e tente de novo.",
-    "rate_limit_error": "Limite de uso da API atingido. Aguarde um pouco e tente de novo.",
-    "api_error": "Erro temporário nos servidores da Anthropic. Tente novamente.",
-    "timeout_error": "O servidor demorou demais para responder. Tente novamente.",
-    "overloaded_error": ("O serviço está sobrecarregado no momento. "
-                         "Tente novamente em instantes."),
-}
-_STATUS_TO_TYPE = {
-    400: "invalid_request_error", 401: "authentication_error", 402: "billing_error",
-    403: "permission_error", 404: "not_found_error", 413: "request_too_large",
-    429: "rate_limit_error", 500: "api_error", 504: "timeout_error",
-    529: "overloaded_error",
-}
-_RETRYABLE_TYPES = {"api_error", "overloaded_error", "timeout_error"}
-
-
-def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+def _parse_duration(value) -> Optional[float]:
+    """Converte durações do Google como "37s" ou "1.5s" em segundos."""
     try:
-        seconds = float(value)  # a API envia segundos
+        return float(str(value).strip().rstrip("s"))
     except (TypeError, ValueError):
         return None
-    return seconds if 0 <= seconds <= 60 else None
 
 
-def make_api_error(error_type: Optional[str], api_message: str = "", *,
-                   status: Optional[int] = None, request_id: str = "",
-                   headers: Optional[dict] = None) -> ApiError:
-    """Converte um erro da API numa ApiError com mensagem em português."""
-    headers = headers or {}
-    etype = error_type or _STATUS_TO_TYPE.get(status or 0) or (
-        "api_error" if (status or 0) >= 500 else "invalid_request_error")
-    message = _ERROR_MESSAGES.get(etype, "Erro inesperado ao contactar a API.")
-    low = (api_message or "").lower()
-    if "credit balance" in low:
-        message = ("Saldo de créditos insuficiente na conta da Anthropic. "
-                   "Adicione créditos no Claude Console (área de faturamento).")
-    elif "spend limit" in low or "usage limit" in low:
-        message = "O limite de gastos definido para esta conta foi atingido."
+def make_api_error(error: dict, status: Optional[int] = None) -> ApiError:
+    """Converte um erro da Gemini API numa ApiError com mensagem em português."""
+    error = error if isinstance(error, dict) else {}
+    try:
+        code = int(status or error.get("code") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    gstatus = str(error.get("status") or "")
+    detail = str(error.get("message") or "")
+    low = detail.lower()
+    reasons, retry_delay = set(), None
+    per_day = "perday" in low.replace("_", "").replace(" ", "")
+    for item in error.get("details") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("@type") or "")
+        if item.get("reason"):
+            reasons.add(str(item["reason"]))
+        if kind.endswith("RetryInfo"):
+            retry_delay = _parse_duration(item.get("retryDelay"))
+        if kind.endswith("QuotaFailure"):
+            for violation in item.get("violations") or []:
+                if not isinstance(violation, dict):
+                    continue
+                quota = "%s %s" % (violation.get("quotaId") or "",
+                                   violation.get("quotaMetric") or "")
+                if "perday" in quota.lower().replace("_", ""):
+                    per_day = True
 
-    retry_after = _parse_retry_after(headers.get("retry-after"))
-    retryable = etype in _RETRYABLE_TYPES or (status or 0) in (500, 502, 503, 504, 529)
-    if etype == "rate_limit_error":
-        # Sem "retry-after" costuma ser teto de gastos: repetir não adianta.
-        retryable = retry_after is not None
-    should_retry = str(headers.get("x-should-retry", "")).lower()
-    if should_retry == "true":
-        retryable = True
-    elif should_retry == "false":
-        retryable = False
-    return ApiError(message, status=status, error_type=etype, request_id=request_id,
-                    retryable=retryable, detail=api_message, retry_after=retry_after)
+    def err(message, etype, retryable=False, retry_after=None):
+        return ApiError(message, status=code or None, error_type=etype or gstatus.lower(),
+                        retryable=retryable, detail=detail, retry_after=retry_after)
+
+    if "API_KEY_INVALID" in reasons or "api key not valid" in low or "api key expired" in low:
+        return err("Chave da API do Gemini inválida ou expirada. Confira-a em “Chave API”.",
+                   "authentication_error")
+    if code == 429 or gstatus == "RESOURCE_EXHAUSTED":
+        if per_day:
+            # A cota diária renova à meia-noite do Pacífico (4h ou 5h em Brasília).
+            return err("Os pedidos gratuitos de hoje no Gemini acabaram. A cota renova "
+                       "todo dia por volta das 5h (horário de Brasília); tente de novo "
+                       "depois disso.", "daily_limit_error")
+        wait = retry_delay if retry_delay is not None and retry_delay <= 30 else None
+        return err("Limite de pedidos por minuto do Gemini atingido. Aguarde um minuto e "
+                   "tente de novo.", "rate_limit_error", retryable=wait is not None,
+                   retry_after=wait)
+    if gstatus == "FAILED_PRECONDITION" or "location is not supported" in low:
+        return err("O plano gratuito do Gemini não está disponível para esta conta ou "
+                   "região.", "permission_error")
+    if code == 403 or gstatus == "PERMISSION_DENIED":
+        return err("Esta chave não tem permissão para usar o Gemini. Crie uma nova chave "
+                   "no Google AI Studio.", "permission_error")
+    if code == 404 or gstatus == "NOT_FOUND":
+        return err("Modelo do Gemini não encontrado. Escolha o outro em “Chave API”.",
+                   "not_found_error")
+    if code == 400 or gstatus == "INVALID_ARGUMENT":
+        return err("O Gemini recusou o pedido (pedido inválido).", "invalid_request_error")
+    if code in (500, 502, 503, 504) or gstatus in ("INTERNAL", "UNAVAILABLE",
+                                                  "DEADLINE_EXCEEDED"):
+        return err("O Gemini está sobrecarregado ou indisponível no momento. Tente "
+                   "novamente em instantes.", "overloaded_error", retryable=True)
+    return err("Erro inesperado ao acessar o Gemini.", "api_error")
 
 
-def error_from_response(status: int, body_text: str, headers) -> ApiError:
-    headers = {str(k).lower(): v for k, v in dict(headers or {}).items()}
+def error_from_response(status: int, body_text: str, headers=None) -> ApiError:
+    """ApiError a partir de uma resposta HTTP de erro (corpo JSON do Google)."""
     data: dict = {}
     try:
         parsed = json.loads(body_text or "")
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            parsed = parsed[0]          # o endpoint de streaming pode devolver uma lista
         if isinstance(parsed, dict):
             data = parsed
     except ValueError:
         pass
-    err = data.get("error") if isinstance(data.get("error"), dict) else {}
-    api_message = err.get("message") or (body_text or "").strip()[:300]
-    request_id = headers.get("request-id") or data.get("request_id") or ""
-    return make_api_error(err.get("type"), api_message, status=status,
-                          request_id=request_id, headers=headers)
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    if not error.get("message"):
+        error = dict(error, message=(body_text or "").strip()[:300])
+    return make_api_error(error, status=status)
 
 
 def network_error_message(exc: BaseException) -> str:
@@ -491,69 +520,79 @@ def iter_sse_events(chunks: Iterable[bytes]) -> Iterator[Tuple[str, str]]:
 @dataclass
 class StreamResult:
     text: str = ""
-    stop_reason: Optional[str] = None
+    stop_reason: Optional[str] = None   # "end_turn", "max_tokens" ou "blocked"
     model: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
     request_id: str = ""
     completed: bool = False
+    finish_detail: str = ""     # motivo original do Google (finishReason/blockReason)
+    notice: str = ""            # aviso para o professor (ex.: troca automática de modelo)
+
+
+FINISH_REASONS = {"STOP": "end_turn", "MAX_TOKENS": "max_tokens"}
+BLOCK_MESSAGES = {
+    "SAFETY": "filtros de segurança",
+    "PROHIBITED_CONTENT": "filtros de conteúdo",
+    "BLOCKLIST": "lista de termos bloqueados",
+    "RECITATION": "semelhança com textos protegidos",
+    "SPII": "dados pessoais sensíveis",
+    "LANGUAGE": "idioma não suportado",
+}
 
 
 def handle_sse_event(event: str, data: str, result: StreamResult,
                      on_text: Callable[[str], None],
                      on_status: Callable[..., None]) -> None:
-    """Aplica um evento da Messages API ao resultado acumulado."""
-    if event == "ping":
+    """Aplica um bloco do streamGenerateContent (?alt=sse) ao resultado acumulado."""
+    if not data or data.strip() == "[DONE]":
         return
     try:
-        payload = json.loads(data) if data else {}
+        payload = json.loads(data)
     except ValueError:
         raise ApiError("Resposta inválida recebida do servidor.", detail=data[:200],
                        retryable=True) from None
-    if not isinstance(payload, dict):
-        return
-    etype = payload.get("type") or event
-
-    if etype == "message_start":
-        message = payload.get("message") or {}
-        result.model = message.get("model") or result.model
-        usage = message.get("usage") or {}
-        result.input_tokens = int(usage.get("input_tokens") or 0)
-        result.output_tokens = int(usage.get("output_tokens") or 0)
-    elif etype == "content_block_start":
-        block = payload.get("content_block") or {}
-        block_type = block.get("type")
-        if block_type in ("thinking", "redacted_thinking"):
-            on_status("thinking")
-        elif block_type == "text":
-            on_status("writing")
-            initial = block.get("text") or ""
-            if initial:
-                result.text += initial
-                on_text(initial)
-    elif etype == "content_block_delta":
-        delta = payload.get("delta") or {}
-        if delta.get("type") == "text_delta":
-            text = delta.get("text") or ""
+    chunks = payload if isinstance(payload, list) else [payload]
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if isinstance(chunk.get("error"), dict):
+            raise make_api_error(chunk["error"])
+        feedback = chunk.get("promptFeedback") or {}
+        if feedback.get("blockReason"):
+            result.stop_reason = "blocked"
+            result.finish_detail = str(feedback["blockReason"])
+            result.completed = True
+            continue
+        if chunk.get("modelVersion"):
+            result.model = str(chunk["modelVersion"]).replace("models/", "", 1)
+        usage = chunk.get("usageMetadata") or {}
+        if usage:
+            result.input_tokens = int(usage.get("promptTokenCount") or result.input_tokens)
+            produced = int(usage.get("candidatesTokenCount") or 0) + \
+                int(usage.get("thoughtsTokenCount") or 0)
+            result.output_tokens = produced or result.output_tokens
+        candidates = chunk.get("candidates") or []
+        if not candidates:
+            continue
+        candidate = candidates[0]
+        for part in (candidate.get("content") or {}).get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("thought"):         # raciocínio interno: não é mostrado
+                on_status("thinking")
+                continue
+            text = part.get("text")
             if text:
+                if not result.text:
+                    on_status("writing")
                 result.text += text
                 on_text(text)
-        # thinking_delta / signature_delta: raciocínio interno, não é mostrado
-    elif etype == "message_delta":
-        delta = payload.get("delta") or {}
-        if delta.get("stop_reason"):
-            result.stop_reason = delta["stop_reason"]
-        usage = payload.get("usage") or {}
-        if usage.get("output_tokens") is not None:
-            result.output_tokens = int(usage["output_tokens"])
-        if usage.get("input_tokens"):
-            result.input_tokens = int(usage["input_tokens"])
-    elif etype == "message_stop":
-        result.completed = True
-    elif etype == "error":
-        error = payload.get("error") or {}
-        raise make_api_error(error.get("type"), error.get("message") or "")
-    # Outros eventos (novos tipos no futuro) são ignorados de propósito.
+        reason = candidate.get("finishReason")
+        if reason and reason != "FINISH_REASON_UNSPECIFIED":
+            result.stop_reason = FINISH_REASONS.get(reason, "blocked")
+            result.finish_detail = str(reason)
+            result.completed = True
 
 
 class ResponseHolder:
@@ -590,36 +629,37 @@ def _backoff(attempt: int) -> float:
     return min(1.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.6), 20.0)
 
 
-def stream_adaptation(api_key: str, payload: dict, *,
-                      on_text: Callable[[str], None],
-                      on_status: Optional[Callable[..., None]] = None,
-                      cancel_event: Optional[threading.Event] = None,
-                      response_holder: Optional[ResponseHolder] = None,
-                      session_factory=None,
-                      max_retries: int = MAX_RETRIES) -> StreamResult:
-    """Envia o pedido à Messages API e entrega o texto aos poucos via ``on_text``.
+def _stream_with_retries(url: str, headers: Dict[str, str], payload: dict, *,
+                         on_text: Callable[[str], None],
+                         on_status: Optional[Callable[..., None]] = None,
+                         cancel_event: Optional[threading.Event] = None,
+                         response_holder: Optional[ResponseHolder] = None,
+                         session_factory=None,
+                         max_retries: int = MAX_RETRIES) -> StreamResult:
+    """Envia um pedido com streaming (SSE) e entrega o texto aos poucos via on_text.
 
-    Deve ser chamada numa thread secundária. Repete automaticamente erros
-    temporários (rede, 5xx, 529) enquanto nenhum texto tiver sido recebido.
+    Deve ser chamado numa thread secundária. Repete automaticamente erros
+    temporários (rede, 5xx, limite por minuto) enquanto nenhum texto tiver sido
+    recebido; o cancelamento interrompe a espera e a leitura.
     """
     requests = _import_requests()
     cancel_event = cancel_event or threading.Event()
     on_status = on_status or (lambda *args: None)
-    headers = build_headers(api_key, stream=True)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     attempt = 0
 
     while True:
         if cancel_event.is_set():
             raise GenerationCancelled()
-        on_status("connecting" if attempt == 0 else "retrying", attempt)
+        if attempt == 0:
+            on_status("connecting", 0)
         session = (session_factory or requests.Session)()
         response = None
         received_text = False
         retry_delay: Optional[float] = None
         try:
             try:
-                response = session.post(API_URL, data=body, headers=headers, stream=True,
+                response = session.post(url, data=body, headers=headers, stream=True,
                                         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             except requests.exceptions.RequestException as exc:
                 if cancel_event.is_set():
@@ -632,7 +672,8 @@ def stream_adaptation(api_key: str, payload: dict, *,
             if response is not None and retry_delay is None:
                 if response_holder is not None:
                     response_holder.set(response)
-                request_id = response.headers.get("request-id", "")
+                request_id = response.headers.get("request-id") or \
+                    response.headers.get("x-request-id") or ""
                 if response.status_code != 200:
                     try:
                         body_text = response.text
@@ -646,6 +687,7 @@ def stream_adaptation(api_key: str, payload: dict, *,
                         raise error
                 else:
                     result = StreamResult(request_id=request_id)
+                    on_status("thinking")        # pedido aceite: o modelo está a trabalhar
                     try:
                         for event, data in iter_sse_events(
                                 response.iter_content(chunk_size=None)):
@@ -653,8 +695,6 @@ def stream_adaptation(api_key: str, payload: dict, *,
                                 raise GenerationCancelled()
                             handle_sse_event(event, data, result, on_text, on_status)
                             received_text = received_text or bool(result.text)
-                            if result.completed:
-                                break
                     except GenerationCancelled:
                         raise
                     except ApiError as error:
@@ -704,18 +744,67 @@ def stream_adaptation(api_key: str, payload: dict, *,
             except Exception:
                 pass
 
-        # Nova tentativa (erro temporário antes de chegar qualquer texto)
+        # Nova tentativa (erro temporário antes de chegar qualquer texto).
+        # O aviso sai antes da espera, para o professor saber porque está à espera.
         attempt += 1
+        on_status("retrying", attempt)
         if cancel_event.wait(retry_delay or 0):
             raise GenerationCancelled()
 
 
+def stream_adaptation(api_key: str, model_id: str, payload: dict, *,
+                      on_text: Callable[[str], None],
+                      on_status: Optional[Callable[..., None]] = None,
+                      cancel_event: Optional[threading.Event] = None,
+                      response_holder: Optional[ResponseHolder] = None,
+                      session_factory=None,
+                      max_retries: int = MAX_RETRIES) -> StreamResult:
+    """Gera a adaptação com o modelo escolhido, com três redes de segurança que só
+    atuam antes de chegar texto:
+
+    * cota diária gratuita esgotada (429) -> usa o outro modelo, que tem cota própria;
+    * modelo retirado pelo Google (404) -> tenta o alias "-latest" equivalente;
+    * nível de raciocínio recusado (400) -> repete sem ele.
+    """
+    option = MODEL_BY_ID.get(model_id)   # modelo da lista em uso (o alias herda dele)
+    current, body, notice, tried = model_id, payload, "", {model_id}
+    while True:
+        url = "%s/models/%s:streamGenerateContent?alt=sse" % (GEMINI_BASE_URL, current)
+        try:
+            result = _stream_with_retries(
+                url, build_headers(api_key, stream=True), body, on_text=on_text,
+                on_status=on_status, cancel_event=cancel_event,
+                response_holder=response_holder, session_factory=session_factory,
+                max_retries=max_retries)
+            result.notice = notice
+            return result
+        except ApiError as error:
+            if error.partial:
+                raise
+            spare = MODEL_BY_ID.get(option.quota_fallback or "") if option else None
+            alias = option.fallback if option else None
+            thinking_rejected = (error.status == 400 and "thinking" in error.detail.lower()
+                                 and "thinkingConfig" in body.get("generationConfig", {}))
+            if error.error_type == "daily_limit_error" and spare and spare.id not in tried:
+                notice = ("Os pedidos gratuitos de hoje no %s acabaram; esta resposta foi "
+                          "gerada pelo %s." % (option.label, spare.label))
+                option, current = spare, spare.id
+                body = with_thinking(body, spare.thinking)
+            elif error.status == 404 and alias and alias not in tried:
+                current = alias
+            elif thinking_rejected:
+                body = with_thinking(body, None)
+            else:
+                raise
+            tried.add(current)
+
+
 def verify_api_key(api_key: str, session_factory=None) -> Tuple[bool, str]:
-    """Testa a chave com GET /v1/models (não consome tokens)."""
+    """Testa a chave listando os modelos (não gasta a cota de pedidos)."""
     requests = _import_requests()
     session = (session_factory or requests.Session)()
     try:
-        response = session.get(MODELS_URL, params={"limit": 1},
+        response = session.get("%s/models" % GEMINI_BASE_URL, params={"pageSize": 1},
                                headers=build_headers(api_key, stream=False),
                                timeout=(CONNECT_TIMEOUT, 30))
     except requests.exceptions.RequestException as exc:
@@ -727,8 +816,15 @@ def verify_api_key(api_key: str, session_factory=None) -> Tuple[bool, str]:
             pass
     if response.status_code == 200:
         return True, "Chave válida! Tudo pronto para adaptar atividades."
-    error = error_from_response(response.status_code, response.text, response.headers)
-    return False, error.message
+    return False, error_from_response(response.status_code, response.text).message
+
+
+def key_warning(api_key: str) -> str:
+    """Aviso quando a chave colada não tem o formato das chaves do Google."""
+    if not api_key or api_key.startswith(KEY_PREFIX):
+        return ""
+    return ('Atenção: as chaves do Gemini costumam começar com "%s". Confira se copiou '
+            'a chave certa.' % KEY_PREFIX)
 
 
 # ---- Preferências (armazenamento privado do app) ---------------------------
@@ -1463,7 +1559,7 @@ KV = """
                 id: column
                 Banner:
                     id: key_banner
-                    text: 'Para começar, adicione a sua chave da API da Anthropic.'
+                    text: 'Para começar, adicione a sua chave gratuita do Google Gemini.'
                     action_text: 'Adicionar chave'
                     on_action: app.show_settings()
                 Card:
@@ -1594,17 +1690,17 @@ KV = """
             Column:
                 Card:
                     Title:
-                        text: 'Chave da API da Anthropic'
+                        text: 'Chave da API do Google Gemini'
                     Caption:
-                        text: 'A chave começa com "sk-ant-". Crie-a no Claude Console; a conta precisa de créditos para usar a API.'
+                        text: 'É grátis e não precisa de cartão. Entre no Google AI Studio com sua conta Google, toque em "Create API key" e copie a chave (começa com "AIza").'
                     TonalButton:
-                        text: 'Abrir o Claude Console'
+                        text: 'Abrir o Google AI Studio'
                         on_release: app.open_console()
                     InputBox:
                         padding: dp(2), dp(2), dp(6), dp(2)
                         AppTextInput:
                             id: key_input
-                            hint_text: 'sk-ant-...'
+                            hint_text: 'AIza...'
                             multiline: False
                             password: show_key.state != 'down'
                             password_mask: '•'
@@ -1642,6 +1738,8 @@ KV = """
                 Card:
                     Title:
                         text: 'Modelo de IA'
+                    Caption:
+                        text: 'Os dois são gratuitos, cada um com o seu limite de pedidos por dia.'
                     BoxLayout:
                         id: models_box
                         orientation: 'vertical'
@@ -1926,6 +2024,7 @@ STATUS_MESSAGES = {
     "thinking": "Analisando a atividade...",
     "writing": "Escrevendo a adaptação...",
 }
+RETRY_MESSAGE = "Serviço ocupado; nova tentativa (%d de %d)..."
 
 
 class AdaptadorApp(App):
@@ -1946,7 +2045,7 @@ class AdaptadorApp(App):
         Window.bind(on_keyboard=self._on_keyboard)
 
         self.prefs_store = PrefsStore(self._data_dir())
-        self.prefs = self.prefs_store.load()
+        self.prefs = self._migrate_prefs(self.prefs_store.load())
         self.model_id = self.prefs.get("model") if self.prefs.get("model") in MODEL_BY_ID \
             else DEFAULT_MODEL
         self.session_key = clean_api_key(self.prefs.get("api_key")) \
@@ -1969,6 +2068,15 @@ class AdaptadorApp(App):
         self.result_screen = root.ids.result_screen
         self.settings_screen = root.ids.settings_screen
         self.toast = root.ids.toast
+        # Widgets que o formulário mostra e esconde. "ids" só guarda referências
+        # fracas: fora da árvore, sem esta referência forte, o coletor de lixo
+        # apagava-os e o app fechava ao tentar mostrá-los de novo.
+        form_ids = self.form.ids
+        self._column = form_ids.column.__self__
+        self._key_banner = form_ids.key_banner.__self__
+        self._form_error = form_ids.form_error.__self__
+        self._go_button = form_ids.go_button.__self__
+        self._last_button = form_ids.last_button.__self__
         self._build_choices()
         return root
 
@@ -1996,6 +2104,26 @@ class AdaptadorApp(App):
     # ------------------------------------------------------------ utilidades
     def _data_dir(self) -> str:
         return os.environ.get("ADAPTADOR_DATA_DIR") or self.user_data_dir
+
+    @staticmethod
+    def _migrate_prefs(prefs: dict) -> dict:
+        """Adapta as preferências das versões anteriores do app.
+
+        Versão 1: "api_key" e "model" eram de outro serviço de IA (descartados).
+        Versão 2: as chaves e os modelos ficavam em "keys" e "models", por serviço;
+        só os do Gemini são mantidos.
+        """
+        if prefs.get("version") == PREFS_VERSION:
+            return prefs
+        keys, models = prefs.pop("keys", None), prefs.pop("models", None)
+        for old in ("provider", "api_key", "model"):
+            prefs.pop(old, None)
+        if isinstance(keys, dict) and clean_api_key(keys.get("gemini")):
+            prefs["api_key"] = clean_api_key(keys["gemini"])
+        if isinstance(models, dict) and models.get("gemini") in MODEL_BY_ID:
+            prefs["model"] = models["gemini"]
+        prefs["version"] = PREFS_VERSION
+        return prefs
 
     def _build_choices(self):
         ids = self.form.ids
@@ -2027,19 +2155,28 @@ class AdaptadorApp(App):
     def notify(self, text: str):
         self.toast.show(text)
 
+    @staticmethod
+    def _env_key() -> Tuple[str, str]:
+        """(variável, chave) da primeira variável de ambiente definida (testes no PC)."""
+        for var in ENV_API_KEYS:
+            value = clean_api_key(os.environ.get(var))
+            if value:
+                return var, value
+        return "", ""
+
     def effective_api_key(self) -> str:
-        return self.session_key or clean_api_key(os.environ.get(ENV_API_KEY))
+        return self.session_key or self._env_key()[1]
 
     def _refresh_key_state(self):
         self.has_api_key = bool(self.effective_api_key())
-        model = MODEL_BY_ID.get(self.model_id) or MODEL_BY_ID[DEFAULT_MODEL]
-        self.model_label = model.label
+        self.model_label = "%s (gratuito)" % MODEL_BY_ID[self.model_id].label
         self._refresh_form_extras()
 
     def _place(self, widget, visible: bool, anchor=None, above: bool = True):
         """Mostra/esconde um widget da coluna do formulário sem deixar espaço vazio."""
-        # "ids" devolve proxies fracos: __self__ dá o widget real (comparações com "is").
-        column = self.form.ids.column.__self__
+        # __self__ dá o widget real (também a partir de um proxy de "ids"),
+        # para as comparações com "is" funcionarem.
+        column = self._column
         widget = widget.__self__
         anchor = anchor.__self__ if anchor is not None else None
         if visible and widget.parent is None:
@@ -2052,15 +2189,13 @@ class AdaptadorApp(App):
             widget.parent.remove_widget(widget)
 
     def _refresh_form_extras(self):
-        ids = self.form.ids
-        self._place(ids.key_banner, not self.has_api_key)
-        self._place(ids.last_button, self.has_result and not self.is_generating,
-                    anchor=ids.go_button, above=False)
+        self._place(self._key_banner, not self.has_api_key)
+        self._place(self._last_button, self.has_result and not self.is_generating,
+                    anchor=self._go_button, above=False)
 
     def _set_form_error(self, message: str):
-        ids = self.form.ids
-        ids.form_error.text = message
-        self._place(ids.form_error, bool(message), anchor=ids.go_button, above=True)
+        self._form_error.text = message
+        self._place(self._form_error, bool(message), anchor=self._go_button, above=True)
 
     def _focused_input(self):
         for field in (self.form.ids.topic, self.form.ids.activity,
@@ -2086,16 +2221,16 @@ class AdaptadorApp(App):
     def show_settings(self):
         screen = self.settings_screen
         screen.ids.key_input.text = self.session_key
-        screen.ids.remember.state = "down" if self.prefs.get("remember_key", True) else "normal"
         screen.ids.show_key.state = "normal"
+        screen.ids.remember.state = "down" if self.prefs.get("remember_key", True) else "normal"
         self._select(screen.ids.models_box, self.model_id)
+        self._verify_id += 1              # descarta uma verificação antiga ainda em curso
         screen.key_status = ""
+        env_var = self._env_key()[0]
         screen.env_note = ("A variável de ambiente %s foi encontrada e será usada se o "
-                           "campo acima estiver vazio." % ENV_API_KEY
-                           if clean_api_key(os.environ.get(ENV_API_KEY)) else "")
+                           "campo acima estiver vazio." % env_var) if env_var else ""
         version = android_app_version() or __version__
-        screen.footer_text = ("O texto da atividade é enviado à Anthropic para ser "
-                              "processado.\nVersão %s" % version)
+        screen.footer_text = "%s\nVersão %s" % (PRIVACY_NOTE, version)
         self._go("settings", "left")
 
     def _on_keyboard(self, _window, key, *_args):
@@ -2183,7 +2318,8 @@ class AdaptadorApp(App):
             return
         api_key = self.effective_api_key()
         if not api_key:
-            self._set_form_error("Adicione a sua chave da API antes de continuar.")
+            self._set_form_error("Adicione a sua chave gratuita do Google Gemini antes de "
+                                 "continuar.")
             self.show_settings()
             return
         if android_is_online() is False:
@@ -2194,10 +2330,10 @@ class AdaptadorApp(App):
         self.save_draft()
         payload = build_payload(self.model_id, topic, level, profile, activity)
         meta = "%s · %s" % (LEVELS[level].title, PROFILES[profile].title)
-        self._launch(api_key, payload, meta)
+        self._launch(api_key, self.model_id, payload, meta)
 
-    def _launch(self, api_key: str, payload: dict, meta: str):
-        self._last_request = (api_key, payload, meta)
+    def _launch(self, api_key: str, model_id: str, payload: dict, meta: str):
+        self._last_request = (api_key, model_id, payload, meta)
         self._gen_id += 1
         gen_id = self._gen_id
         if self._cancel_event is not None:
@@ -2219,11 +2355,12 @@ class AdaptadorApp(App):
         self.show_result()
 
         worker = threading.Thread(
-            target=self._worker, args=(gen_id, api_key, payload, self._cancel_event),
+            target=self._worker,
+            args=(gen_id, api_key, model_id, payload, self._cancel_event),
             name="adaptador-stream", daemon=True)
         worker.start()
 
-    def _worker(self, gen_id: int, api_key: str, payload: dict,
+    def _worker(self, gen_id: int, api_key: str, model_id: str, payload: dict,
                 cancel_event: threading.Event):
         """Corre fora da thread da interface: nunca mexe diretamente em widgets."""
 
@@ -2232,16 +2369,15 @@ class AdaptadorApp(App):
                 with self._text_lock:
                     self._text_buffer.append(text)
 
-        def on_status(kind: str, attempt: int = 0):
+        def on_status(kind: str, attempt: int = 0, *_args):
             message = STATUS_MESSAGES.get(kind, "")
             if kind == "retrying":
-                message = "Serviço ocupado; nova tentativa (%d de %d)..." % (
-                    attempt + 1, MAX_RETRIES + 1)
+                message = RETRY_MESSAGE % (attempt + 1, MAX_RETRIES + 1)
             if message:
                 self._post(gen_id, self._on_stream_status, message)
 
         try:
-            result = stream_adaptation(api_key, payload, on_text=on_text,
+            result = stream_adaptation(api_key, model_id, payload, on_text=on_text,
                                        on_status=on_status, cancel_event=cancel_event,
                                        response_holder=self._response_holder)
             self._post(gen_id, self._on_done, result)
@@ -2300,12 +2436,20 @@ class AdaptadorApp(App):
         text = self.result_screen.ids.result.text.strip()
         model = MODEL_BY_ID.get(result.model)
         detail = "%s · %d tokens de entrada · %d de saída" % (
-            model.label if model else (result.model or "Claude"),
+            model.label if model else (result.model or "Gemini"),
             result.input_tokens, result.output_tokens)
-        if result.stop_reason == "refusal":
-            self._set_status("error", "O modelo não pôde processar este pedido. Reveja o "
-                             "texto da atividade e tente novamente.", detail, "Tentar de novo")
-        elif result.stop_reason in ("max_tokens", "model_context_window_exceeded"):
+        if result.notice:
+            detail = "%s\n%s" % (result.notice, detail)
+        if result.stop_reason == "blocked":
+            reason = BLOCK_MESSAGES.get(result.finish_detail, "filtros do serviço")
+            if text:
+                self._set_status("warning", "O Gemini interrompeu a resposta (%s); o texto "
+                                 "pode estar incompleto." % reason, detail, "Tentar de novo")
+            else:
+                self._set_status("error", "O Gemini não gerou a resposta (%s). Reveja o "
+                                 "texto da atividade e tente novamente." % reason, detail,
+                                 "Tentar de novo")
+        elif result.stop_reason == "max_tokens":
             self._set_status("warning", "A resposta atingiu o limite de tamanho e pode "
                              "estar incompleta. Tente dividir a atividade.", detail)
         elif not text:
@@ -2367,12 +2511,15 @@ class AdaptadorApp(App):
 
     # ------------------------------------------------------------ configurações
     def open_console(self):
-        if not android_open_url(CONSOLE_KEYS_URL):
-            try:
-                import webbrowser
-                webbrowser.open(CONSOLE_KEYS_URL)
-            except Exception:
-                self.notify(CONSOLE_KEYS_URL)
+        if android_open_url(GEMINI_KEYS_URL):
+            return
+        try:
+            import webbrowser
+            if webbrowser.open(GEMINI_KEYS_URL):
+                return
+        except Exception:
+            pass
+        self.notify(GEMINI_KEYS_URL)
 
     def _set_key_status(self, text: str, color_name: str):
         screen = self.settings_screen
@@ -2380,8 +2527,7 @@ class AdaptadorApp(App):
         screen.key_status_color = list(get_color_from_hex(PALETTE[color_name]))
 
     def verify_key(self):
-        key = clean_api_key(self.settings_screen.ids.key_input.text) or \
-            clean_api_key(os.environ.get(ENV_API_KEY))
+        key = clean_api_key(self.settings_screen.ids.key_input.text) or self._env_key()[1]
         if not key:
             self._set_key_status("Digite ou cole a chave primeiro.", "ERROR")
             return
@@ -2390,7 +2536,11 @@ class AdaptadorApp(App):
         self._set_key_status("Verificando...", "TEXT_MUTED")
 
         def work():
-            ok, message = verify_api_key(key)
+            try:
+                ok, message = verify_api_key(key)
+            except Exception as exc:  # nunca deixar a thread morrer em silêncio
+                ok, message = False, "Não foi possível verificar a chave (%s)." % (
+                    type(exc).__name__)
             Clock.schedule_once(lambda _dt: self._on_verified(verify_id, ok, message), 0)
 
         threading.Thread(target=work, name="adaptador-verify", daemon=True).start()
@@ -2399,20 +2549,25 @@ class AdaptadorApp(App):
         if verify_id == self._verify_id:
             self._set_key_status(message, "SUCCESS" if ok else "ERROR")
 
+    def _save_prefs(self):
+        try:
+            self.prefs_store.save(self.prefs)
+        except Exception as exc:
+            Logger.warning("Adaptador: falha ao guardar preferências: %s", exc)
+
     def clear_key(self):
         self.settings_screen.ids.key_input.text = ""
         self.session_key = ""
         self.prefs.pop("api_key", None)
-        self.prefs_store.save(self.prefs)
+        self._save_prefs()
         self._refresh_key_state()
+        self._verify_id += 1              # descarta uma verificação ainda em curso
         self._set_key_status("Chave apagada deste aparelho.", "TEXT_MUTED")
 
     def save_settings(self):
         screen = self.settings_screen
         key = clean_api_key(screen.ids.key_input.text)
         remember = screen.ids.remember.state == "down"
-        if key and not key.startswith("sk-ant-"):
-            self.notify('Atenção: chaves da Anthropic costumam começar com "sk-ant-".')
         self.session_key = key
         self.model_id = self._selected(screen.ids.models_box) or self.model_id
         self.prefs["model"] = self.model_id
@@ -2421,13 +2576,14 @@ class AdaptadorApp(App):
             self.prefs["api_key"] = key
         else:
             self.prefs.pop("api_key", None)
-        try:
-            self.prefs_store.save(self.prefs)
-        except Exception as exc:
-            Logger.warning("Adaptador: falha ao guardar preferências: %s", exc)
+        self._save_prefs()
         self._refresh_key_state()
-        self.notify("Configurações salvas." if self.has_api_key
-                    else "Salvo. Falta adicionar a chave da API.")
+        warning = key_warning(key)
+        if warning:
+            self.notify(warning)
+        else:
+            self.notify("Configurações salvas." if self.has_api_key
+                        else "Salvo. Falta adicionar a chave da API.")
         self.go_form()
 
 

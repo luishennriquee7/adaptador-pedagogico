@@ -37,8 +37,8 @@ version = 1.0.0
 
 # (list) Bibliotecas Python.
 # - kivy 2.3.1 é a versão da receita do python-for-android 2026.05.09;
-# - requests/urllib3/idna/certifi: HTTPS para a API da Anthropic (certifi sem
-#   versão fixa para trazer sempre os certificados raiz mais recentes);
+# - requests/urllib3/idna/certifi: HTTPS para a API do Google Gemini (certifi
+#   sem versão fixa para trazer sempre os certificados raiz mais recentes);
 # - chardet 5.2.0: dependência que a receita do Kivy já pede; fixada porque
 #   as versões 6+ trazem módulos compilados para PC que não servem no Android.
 # Não acrescente charset-normalizer: o requests funciona com o chardet e as
